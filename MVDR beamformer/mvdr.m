@@ -5,6 +5,10 @@
 
 clear; close all; clc;
 
+%% Fix random seed for reproducibility
+rng(42);  % Fixed seed so results are consistent
+fprintf('Random seed fixed for reproducibility\n');
+
 %% -------------------- PARAMETERS ----------------------------------------
 fprintf('=== STEP 1: PARAMETER INITIALIZATION ===\n');
 
@@ -55,7 +59,9 @@ fprintf('Target signal created: length = %d\n', length(target));
 interf = randn(nSamples, 1);
 [b, a] = butter(4, [500 3000]/(fs/2), 'bandpass');
 interf = filter(b, a, interf);
-interf = interf / max(abs(interf)) * 0.7;
+% Make interference stronger for clearer beamforming effect
+interf = interf / max(abs(interf)) * 1.5;  % Increased from 0.7 to 1.5
+fprintf('Interference scaled to %.2f\n', 1.5);
 fprintf('Interference signal created: length = %d\n', length(interf));
 
 %% -------------------- VERIFY SIGNAL CREATION ---------------------------
@@ -126,11 +132,12 @@ fprintf('Microphone signals created: size(received) = [%d, %d]\n', size(received
 % (This must be defined before it's used)
 
 function d = steering_vector(mic_pos, angle, freq, c)
+    % CORRECTED steering vector (removed negative sign)
     % mic_pos: column vector of microphone positions (M x 1)
     % angle:   direction in degrees
     % freq:    frequency in Hz
     % returns: steering vector (M x 1)
-    d = exp(-1j * 2 * pi * freq * (mic_pos * cosd(angle)) / c);
+    d = exp(1j * 2 * pi * freq * (mic_pos * cosd(angle)) / c);
 end
 
 fprintf('\n=== STEP 5: STEERING VECTOR FUNCTION DEFINED ===\n');
@@ -159,8 +166,8 @@ Y_mvdr = zeros(nFreq, nFrames);
 Y_ds   = zeros(nFreq, nFrames);   % Delay‑sum for comparison
 
 % Regularization factor for covariance matrix inversion
-reg = 1e-3;   % small diagonal loading
-
+reg = 1e-1;  % Even stronger regularization
+fprintf('Regularization factor: %.4f\n', reg);
 % Process each frequency bin independently
 for f = 1:nFreq
     freq = (f-1) * fs / win_len;
@@ -174,6 +181,7 @@ for f = 1:nFreq
     d_target = steering_vector(mic_pos, target_angle, freq, c);
     
     % --- Delay‑Sum weights (for comparison) ---
+    % Correct delay-sum weights (use conjugate for proper phase alignment)
     w_ds = conj(d_target) / M;
     
     % --- MVDR weights ---
@@ -194,10 +202,15 @@ for f = 1:nFreq
     try
         R_inv_d = R_reg \ d_target;
         w_mvdr = R_inv_d / (d_target' * R_inv_d);
+        
+        % Check if weights are reasonable
+        if any(isnan(w_mvdr)) || any(isinf(w_mvdr))
+            error('Numerical issues');
+        end
     catch
-        % If inversion fails, fall back to delay-sum
-        w_mvdr = w_ds;
-        fprintf('Warning: Inversion failed at freq %.2f Hz, using DS\n', freq);
+        % If inversion fails, use a simple DS as fallback
+        fprintf('Warning: MVDR failed at freq %.2f Hz, using DS\n', freq);
+        w_mvdr = conj(d_target) / M;  % Use correct DS weights
     end
     
     % Apply weights to each frame - USING frame_idx INSTEAD OF t
@@ -208,6 +221,44 @@ for f = 1:nFreq
     end
 end
 fprintf('Frequency-domain processing complete\n');
+
+%% -------------------- MVDR DEBUG - CHECK WEIGHTS ---------------------
+fprintf('\n=== MVDR DEBUG ===\n');
+
+% Check a few frequency bins to see what's happening
+test_freqs = [10, 50, 100];  % frequency bin indices
+for f_idx = test_freqs
+    freq = (f_idx-1) * fs / win_len;
+    if freq < 100 || freq > 7000
+        continue;
+    end
+    
+    d_target = steering_vector(mic_pos, target_angle, freq, c);
+    w_ds = d_target' / M;
+    
+    % Get covariance matrix for this frequency
+    X_f = squeeze(X(f_idx,:,:));
+    R = (X_f' * X_f) / nFrames;
+    R_reg = R + reg * eye(M);
+    
+    try
+        w_mvdr = (R_reg \ d_target) / (d_target' * (R_reg \ d_target));
+        
+        % Check if MVDR weights are reasonable
+        fprintf('\nFrequency %.0f Hz:\n', freq);
+        fprintf('  DS weight norm: %.3f\n', norm(w_ds));
+        fprintf('  MVDR weight norm: %.3f\n', norm(w_mvdr));
+        fprintf('  DS output power estimate: %.3f\n', w_ds' * R * w_ds);
+        fprintf('  MVDR output power estimate: %.3f\n', w_mvdr' * R * w_mvdr);
+        
+        % Check if MVDR is actually minimizing power
+        if w_mvdr' * R * w_mvdr > w_ds' * R * w_ds
+            fprintf('  WARNING: MVDR not minimizing power!\n');
+        end
+    catch
+        fprintf('  MVDR failed at freq %.0f Hz\n', freq);
+    end
+end
 
 %% -------------------- INVERSE STFT FUNCTION ----------------------------
 function x = istft_mvdr(S, win, hop, nSamples)
@@ -232,6 +283,62 @@ beamformed_ds   = istft_mvdr(Y_ds,   win, hop, nSamples);
 beamformed_mvdr = istft_mvdr(Y_mvdr, win, hop, nSamples);
 fprintf('Beamformed signals created: length(beamformed_ds) = %d\n', length(beamformed_ds));
 fprintf('Beamformed signals created: length(beamformed_mvdr) = %d\n', length(beamformed_mvdr));
+
+%% -------------------- DIAGNOSTICS - CHECK BEAMFORMING -----------------
+fprintf('\n=== DIAGNOSTICS - CHECKING BEAMFORMER OUTPUT ===\n');
+
+% Simple time-domain delay-sum for verification
+simple_ds = zeros(nSamples, 1);
+min_delay = min(target_delay_samps);
+for m = 1:M
+    shift = target_delay_samps(m) - min_delay;
+    if shift > 0
+        % For positive shift, we need to delay the OTHER channels,
+        % not shift this one left. This might be your issue!
+        % Let's fix it:
+        simple_ds(1+shift:end) = simple_ds(1+shift:end) + received(1:end-shift, m);
+    else
+        simple_ds = simple_ds + received(:, m);
+    end
+end
+simple_ds = simple_ds / M;
+
+% Compare with frequency-domain DS
+corr_val = corrcoef(simple_ds(1000:9000), beamformed_ds(1000:9000));
+fprintf('Correlation between simple DS and freq-domain DS: %.3f\n', corr_val(1,2));
+if corr_val(1,2) < 0.9
+    fprintf('WARNING: Low correlation! Frequency-domain implementation may be wrong.\n');
+end
+
+% Check signal statistics
+fprintf('\nSignal Statistics:\n');
+fprintf('  Target: mean=%.3f, std=%.3f, range=[%.2f, %.2f]\n', ...
+        mean(target), std(target), min(target), max(target));
+fprintf('  Mic 1: mean=%.3f, std=%.3f, range=[%.2f, %.2f]\n', ...
+        mean(received(:,1)), std(received(:,1)), min(received(:,1)), max(received(:,1)));
+fprintf('  DS out: mean=%.3f, std=%.3f, range=[%.2f, %.2f]\n', ...
+        mean(beamformed_ds), std(beamformed_ds), min(beamformed_ds), max(beamformed_ds));
+fprintf('  MVDR out: mean=%.3f, std=%.3f, range=[%.2f, %.2f]\n', ...
+        mean(beamformed_mvdr), std(beamformed_mvdr), min(beamformed_mvdr), max(beamformed_mvdr));
+
+% Check correlation with target
+[c_ds, l_ds] = xcorr(beamformed_ds, target);
+[c_mvdr, l_mvdr] = xcorr(beamformed_mvdr, target);
+[peak_ds, idx_ds] = max(abs(c_ds));
+[peak_mvdr, idx_mvdr] = max(abs(c_mvdr));
+fprintf('\nCorrelation with target:\n');
+fprintf('  DS: peak=%.3f at lag=%d samples\n', peak_ds, l_ds(idx_ds));
+fprintf('  MVDR: peak=%.3f at lag=%d samples\n', peak_mvdr, l_mvdr(idx_mvdr));
+
+% Quick listen test (uncomment to hear)
+% fprintf('\nPlaying target...\n');
+% soundsc(target, fs);
+% pause(3);
+% fprintf('Playing DS output...\n');
+% soundsc(beamformed_ds, fs);
+% pause(3);
+% fprintf('Playing MVDR output...\n');
+% soundsc(beamformed_mvdr, fs);
 
 %% -------------------- PROTECT TIME VECTOR -----------------------------
 % Double-check that t_safe is still valid
@@ -336,24 +443,40 @@ for idx = 1:3
 end
 sgtitle('Beampattern Comparison: Delay-Sum (blue) vs MVDR (red)');
 
-%% -------------------- PERFORMANCE METRICS ------------------------------
+%% -------------------- PERFORMANCE METRICS - CORRECTED -----------------
 fprintf('\n=== STEP 10: PERFORMANCE METRICS ===\n');
 
 % Compute input SNR (using first microphone as reference)
-noise_in_mic1 = received(:,1) - target_atten * target;
-input_SNR = 10*log10( mean(target.^2) / mean(noise_in_mic1.^2) );
+% First, align the target with the microphone signal
+[c_target, l_target] = xcorr(received(:,1), target);
+[~, idx_target] = max(abs(c_target));
+target_delay = l_target(idx_target);
+
+if target_delay > 0
+    target_aligned_input = [zeros(target_delay,1); target(1:end-target_delay)];
+elseif target_delay < 0
+    target_aligned_input = target(-target_delay+1:end);
+    target_aligned_input = [target_aligned_input; zeros(-target_delay,1)];
+else
+    target_aligned_input = target;
+end
+len_input = min(length(target_aligned_input), length(received(:,1)));
+target_aligned_input = target_aligned_input(1:len_input);
+mic1_trim = received(1:len_input,1);
+
+noise_in_mic1 = mic1_trim - target_aligned_input;
+input_SNR = 10*log10( mean(target_aligned_input.^2) / mean(noise_in_mic1.^2) );
 fprintf('Input SNR (Mic 1): %.2f dB\n', input_SNR);
 
-% Align outputs with target (use cross-correlation)
+% Align outputs with target using cross-correlation
+fprintf('\nAligning beamformed outputs with target...\n');
+
+% Delay-Sum alignment
 [c_ds, lag_ds] = xcorr(beamformed_ds, target);
 [~, idx_ds] = max(abs(c_ds));
 delay_ds = lag_ds(idx_ds);
+fprintf('DS optimal lag: %d samples\n', delay_ds);
 
-[c_mvdr, lag_mvdr] = xcorr(beamformed_mvdr, target);
-[~, idx_mvdr] = max(abs(c_mvdr));
-delay_mvdr = lag_mvdr(idx_mvdr);
-
-% Align target with delay-sum output
 if delay_ds > 0
     target_aligned_ds = [zeros(delay_ds,1); target(1:end-delay_ds)];
 elseif delay_ds < 0
@@ -366,7 +489,12 @@ len_ds = min(length(target_aligned_ds), length(beamformed_ds));
 target_aligned_ds = target_aligned_ds(1:len_ds);
 bf_ds_trim = beamformed_ds(1:len_ds);
 
-% Align target with MVDR output
+% MVDR alignment
+[c_mvdr, lag_mvdr] = xcorr(beamformed_mvdr, target);
+[~, idx_mvdr] = max(abs(c_mvdr));
+delay_mvdr = lag_mvdr(idx_mvdr);
+fprintf('MVDR optimal lag: %d samples\n', delay_mvdr);
+
 if delay_mvdr > 0
     target_aligned_mvdr = [zeros(delay_mvdr,1); target(1:end-delay_mvdr)];
 elseif delay_mvdr < 0
@@ -398,11 +526,10 @@ plot(t_plot, residual_ds(1:plot_len), 'r', 'LineWidth', 0.8);
 hold on;
 plot(t_plot, residual_mvdr(1:plot_len), 'b', 'LineWidth', 0.8);
 xlabel('Time (s)'); ylabel('Amplitude');
-title('Residual Noise Comparison');
+title('Residual Noise Comparison (after alignment)');
 legend('Delay-Sum Residual', 'MVDR Residual');
 xlim([t_plot(1), t_plot(end)]);
 grid on;
-
 %% -------------------- FINAL VERIFICATION -------------------------------
 fprintf('\n=== FINAL VARIABLE CHECK ===\n');
 fprintf('At end of script:\n');
@@ -411,3 +538,46 @@ fprintf('  length(t_safe): %d\n', length(t_safe));
 fprintf('  t_safe(1): %.6f, t_safe(end): %.6f\n', t_safe(1), t_safe(end));
 fprintf('Script completed at: %s\n', datestr(now));
 fprintf('\n=== SCRIPT COMPLETED SUCCESSFULLY ===\n');
+
+%% -------------------- QUICK VERIFICATION PLOT -------------------------
+figure('Position', [100 100 1000 600]);
+
+% Plot the aligned signals for verification
+subplot(2,1,1);
+plot(t_plot, target_aligned_ds(1:plot_len), 'b', 'LineWidth', 1.5);
+hold on;
+plot(t_plot, bf_ds_trim(1:plot_len), 'r', 'LineWidth', 1);
+xlabel('Time (s)'); ylabel('Amplitude');
+title('Delay-Sum: Target (blue) vs Beamformed (red) after alignment');
+legend('Target', 'DS Output');
+xlim([t_plot(1), t_plot(end)]);
+grid on;
+
+subplot(2,1,2);
+plot(t_plot, target_aligned_mvdr(1:plot_len), 'b', 'LineWidth', 1.5);
+hold on;
+plot(t_plot, bf_mvdr_trim(1:plot_len), 'm', 'LineWidth', 1);
+xlabel('Time (s)'); ylabel('Amplitude');
+title('MVDR: Target (blue) vs Beamformed (magenta) after alignment');
+legend('Target', 'MVDR Output');
+xlim([t_plot(1), t_plot(end)]);
+grid on;
+
+%% -------------------- FINAL DIAGNOSTIC --------------------------------
+fprintf('\n=== FINAL DIAGNOSTIC ===\n');
+
+% Check if beamformers are preserving the target
+target_energy = sum(target.^2);
+ds_energy = sum(beamformed_ds.^2);
+mvdr_energy = sum(beamformed_mvdr.^2);
+
+fprintf('Target energy: %.2f\n', target_energy);
+fprintf('DS energy: %.2f (ratio: %.2f)\n', ds_energy, ds_energy/target_energy);
+fprintf('MVDR energy: %.2f (ratio: %.2f)\n', mvdr_energy, mvdr_energy/target_energy);
+
+if ds_energy/target_energy < 0.5
+    fprintf('WARNING: DS is attenuating the target too much!\n');
+end
+if mvdr_energy/target_energy < 0.3
+    fprintf('WARNING: MVDR is attenuating the target too much!\n');
+end
